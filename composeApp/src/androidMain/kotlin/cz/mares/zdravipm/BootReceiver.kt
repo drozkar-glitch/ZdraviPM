@@ -26,6 +26,7 @@ class BootReceiver : BroadcastReceiver() {
                 if (cfg.backgroundServiceEnabled && !pairedAddr.isNullOrBlank()) {
                     ContourSyncService.registerPassiveWatch(appCtx)
                 }
+                TuyaScaleSyncJobService.syncSchedule(appCtx)
             }
 
             BluetoothAdapter.ACTION_STATE_CHANGED -> {
@@ -63,11 +64,13 @@ class BootReceiver : BroadcastReceiver() {
                     )
                     ContourSyncService.registerPassiveWatch(appCtx)
                 }
+                TuyaScaleSyncJobService.triggerOpportunisticCheckIfDue(appCtx)
                 spustAsynchronniProbuzeni(appCtx, devAddr)
             }
 
             ContourSyncService.ACTION_PASSIVE_BLE_FOUND -> {
                 if (!cfg.backgroundServiceEnabled || pairedAddr.isNullOrBlank()) return
+                TuyaScaleSyncJobService.triggerOpportunisticCheckIfDue(appCtx)
                 spustAsynchronniProbuzeni(appCtx, pairedAddr)
             }
         }
