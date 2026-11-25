@@ -7,12 +7,11 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BluetoothDisabled
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.HealthAndSafety
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
-import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -25,6 +24,13 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
+
+private fun adaptSettingsHeight(current: Int, parsed: Double): Int = parsed.roundToInt()
+private fun adaptSettingsHeight(current: Double, parsed: Double): Double = parsed
+private fun formatSettingsHeight(v: Int): String = v.toString()
+private fun formatSettingsHeight(v: Double): String =
+    if (v % 1.0 == 0.0) v.toInt().toString() else FormatUtils.oneDecimal(v)
 
 @Composable
 fun SettingsTabContent(
@@ -35,23 +41,79 @@ fun SettingsTabContent(
     val credentialBridge = rememberCredentialBridge()
     val scope = rememberCoroutineScope()
 
-    var accessId by remember(cfg.tuyaAccessId) { mutableStateOf(cfg.tuyaAccessId) }
-    var accessSecret by remember(cfg.tuyaAccessSecret) { mutableStateOf(cfg.tuyaAccessSecret) }
-    var deviceId by remember(cfg.tuyaDeviceId) { mutableStateOf(cfg.tuyaDeviceId) }
-    var endpoint by remember(cfg.tuyaEndpoint) { mutableStateOf(cfg.tuyaEndpoint) }
-    var showSecret by remember { mutableStateOf(false) }
-
-    var heightText by remember(cfg.heightCm) { mutableStateOf(cfg.heightCm.toString()) }
+    var heightText by remember(cfg.heightCm) { mutableStateOf(formatSettingsHeight(cfg.heightCm)) }
     var birthYearText by remember(cfg.birthYear) { mutableStateOf(cfg.birthYear.toString()) }
     var isMale by remember(cfg.isMale) { mutableStateOf(cfg.isMale) }
-    var writeBodyComp by remember(cfg.writeBodyCompositionToHc) { mutableStateOf(cfg.writeBodyCompositionToHc) }
-    var toleranceText by remember(cfg.weightToleranceKg) { mutableStateOf(FormatUtils.oneDecimal(cfg.weightToleranceKg)) }
-    var gluMinText by remember(cfg.targetGlucoseMin) { mutableStateOf(FormatUtils.oneDecimal(cfg.targetGlucoseMin)) }
-    var gluMaxText by remember(cfg.targetGlucoseMax) { mutableStateOf(FormatUtils.oneDecimal(cfg.targetGlucoseMax)) }
-    var savedBanner by remember { mutableStateOf(false) }
+    var toleranceText by remember(cfg.weightToleranceKg) {
+        mutableStateOf(FormatUtils.oneDecimal(cfg.weightToleranceKg))
+    }
+    var minGlucoseText by remember(cfg.targetGlucoseMin) {
+        mutableStateOf(FormatUtils.oneDecimal(cfg.targetGlucoseMin))
+    }
+    var maxGlucoseText by remember(cfg.targetGlucoseMax) {
+        mutableStateOf(FormatUtils.oneDecimal(cfg.targetGlucoseMax))
+    }
+    var writeComposition by remember(cfg.writeBodyCompositionToHc) {
+        mutableStateOf(cfg.writeBodyCompositionToHc)
+    }
+    var bgWatchEnabled by remember(cfg.backgroundServiceEnabled) {
+        mutableStateOf(cfg.backgroundServiceEnabled)
+    }
+
+    var accessIdText by remember(cfg.tuyaAccessId) { mutableStateOf(cfg.tuyaAccessId) }
+    var accessSecretText by remember(cfg.tuyaAccessSecret) { mutableStateOf(cfg.tuyaAccessSecret) }
+    var deviceIdText by remember(cfg.tuyaDeviceId) {
+        mutableStateOf(cfg.tuyaDeviceId.ifBlank { "00821002c45bbee6ebbe" })
+    }
+    var endpointText by remember(cfg.tuyaEndpoint) {
+        mutableStateOf(cfg.tuyaEndpoint.ifBlank { "https://openapi.tuyaeu.com" })
+    }
+    var showSecret by remember { mutableStateOf(false) }
+    var saveFeedback by remember { mutableStateOf("") }
 
     val pendingCount = uiState.glucoseList.count { !it.syncedToHealthConnect } +
         uiState.scaleList.count { !it.syncedToHealthConnect }
+
+    val saveAllSettings = {
+        val parsedH = heightText.replace(',', '.').trim().toDoubleOrNull()?.coerceIn(100.0, 230.0)
+            ?: cfg.heightCm.toDouble()
+        val parsedYear = birthYearText.trim().toIntOrNull()?.coerceIn(1920, 2025) ?: cfg.birthYear
+        val parsedTol = toleranceText.replace(',', '.').trim().toDoubleOrNull()?.coerceIn(2.0, 40.0)
+            ?: cfg.weightToleranceKg
+        val parsedMinG = minGlucoseText.replace(',', '.').trim().toDoubleOrNull()?.coerceIn(2.0, 10.0)
+            ?: cfg.targetGlucoseMin
+        val parsedMaxG = maxGlucoseText.replace(',', '.').trim().toDoubleOrNull()?.coerceIn(4.0, 20.0)
+            ?: cfg.targetGlucoseMax
+
+        val cleanId = accessIdText.trim()
+        val cleanSecret = accessSecretText.trim()
+        val cleanDev = deviceIdText.trim().ifBlank { "00821002c45bbee6ebbe" }
+        val cleanEnd = endpointText.trim().ifBlank { "https://openapi.tuyaeu.com" }
+
+        val updated = cfg.copy(
+            tuyaAccessId = cleanId,
+            tuyaAccessSecret = cleanSecret,
+            tuyaDeviceId = cleanDev,
+            tuyaEndpoint = cleanEnd,
+            heightCm = adaptSettingsHeight(cfg.heightCm, parsedH),
+            birthYear = parsedYear,
+            isMale = isMale,
+            weightToleranceKg = parsedTol,
+            targetGlucoseMin = parsedMinG,
+            targetGlucoseMax = parsedMaxG,
+            writeBodyCompositionToHc = writeComposition,
+            backgroundServiceEnabled = bgWatchEnabled
+        )
+        bridge.saveScaleConfig(updated)
+        bridge.setBackgroundServiceEnabled(bgWatchEnabled)
+        saveFeedback = "Nastavení bylo uloženo v telefonu."
+
+        if (credentialBridge.isSupported && cleanId.isNotBlank() && cleanSecret.isNotBlank()) {
+            scope.launch {
+                credentialBridge.saveCredentials(cleanId, cleanSecret)
+            }
+        }
+    }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -65,16 +127,16 @@ fun SettingsTabContent(
             ) {
                 Column(
                     modifier = Modifier.fillMaxWidth().padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Icon(
-                            imageVector = if (uiState.healthConnectGranted) Icons.Default.CheckCircle else Icons.Default.HealthAndSafety,
+                            imageVector = if (uiState.healthConnectGranted) Icons.Default.CheckCircle else Icons.Default.ErrorOutline,
                             contentDescription = null,
-                            tint = if (uiState.healthConnectGranted) Color(0xFF1B8755) else MaterialTheme.colorScheme.primary
+                            tint = if (uiState.healthConnectGranted) Color(0xFF1B8755) else MaterialTheme.colorScheme.error
                         )
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
@@ -91,50 +153,48 @@ fun SettingsTabContent(
                     }
 
                     if (uiState.lastSyncMessage.isNotBlank()) {
+                        val isErr = uiState.lastSyncMessage.contains("Chyba", ignoreCase = true)
                         Text(
                             text = uiState.lastSyncMessage,
                             style = MaterialTheme.typography.bodySmall,
                             fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.primary
+                            color = if (isErr) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
                         )
                     }
 
                     if (!uiState.healthConnectGranted) {
                         Button(
                             onClick = { bridge.requestHealthConnectPermissions() },
-                            enabled = uiState.healthConnectAvailable,
                             modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                             shape = RoundedCornerShape(14.dp)
                         ) {
-                            Icon(Icons.Default.Warning, contentDescription = null)
-                            Spacer(Modifier.width(6.dp))
-                            Text("Povolit zápis do Health Connect")
+                            Text("Povolit přístup v Health Connect")
                         }
                     }
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    Button(
+                        onClick = { bridge.syncAllPendingToHealthConnect() },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                        shape = RoundedCornerShape(14.dp)
                     ) {
-                        Button(
-                            onClick = { bridge.syncAllPendingToHealthConnect() },
-                            enabled = uiState.healthConnectAvailable,
-                            modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                            shape = RoundedCornerShape(14.dp)
-                        ) {
-                            Icon(Icons.Default.Sync, contentDescription = null)
-                            Spacer(Modifier.width(6.dp))
-                            Text(if (pendingCount > 0) "Odeslat čekající ($pendingCount)" else "Synchronizovat vše")
-                        }
+                        Icon(Icons.Default.Sync, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = if (pendingCount > 0) {
+                                "Odeslat čekající ($pendingCount)"
+                            } else {
+                                "Synchronizovat s Health Connect"
+                            },
+                            maxLines = 1
+                        )
+                    }
 
-                        OutlinedButton(
-                            onClick = { bridge.openHealthConnectSystemSettings() },
-                            enabled = uiState.healthConnectAvailable,
-                            modifier = Modifier.heightIn(min = 48.dp),
-                            shape = RoundedCornerShape(14.dp)
-                        ) {
-                            Text("Otevřít HC")
-                        }
+                    OutlinedButton(
+                        onClick = { bridge.openHealthConnectSystemSettings() },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Text("Otevřít Health Connect", maxLines = 1)
                     }
 
                     Text(
@@ -150,17 +210,17 @@ fun SettingsTabContent(
             Card(shape = RoundedCornerShape(20.dp)) {
                 Column(
                     modifier = Modifier.fillMaxWidth().padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(
-                        text = "Osobní parametry a filtr váhy",
+                        text = "Osobní parametry a filtrování",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         OutlinedTextField(
                             value = heightText,
@@ -182,49 +242,26 @@ fun SettingsTabContent(
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Text("Pohlaví pro výpočet BIA:", style = MaterialTheme.typography.bodyMedium)
                         FilterChip(
                             selected = isMale,
                             onClick = { isMale = true },
-                            label = { Text("Muž") }
+                            label = { Text("Muž") },
+                            modifier = Modifier.heightIn(min = 48.dp)
                         )
                         FilterChip(
                             selected = !isMale,
                             onClick = { isMale = false },
-                            label = { Text("Žena") }
-                        )
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Zapisovat složení těla do Health Connect",
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Text(
-                                text = "Tuk %, beztuková a kostní hmota, tělesná voda, BMR a výška",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Switch(
-                            checked = writeBodyComp,
-                            onCheckedChange = { writeBodyComp = it }
+                            label = { Text("Žena") },
+                            modifier = Modifier.heightIn(min = 48.dp)
                         )
                     }
 
                     OutlinedTextField(
                         value = toleranceText,
                         onValueChange = { toleranceText = it },
-                        label = { Text("Plovoucí tolerance váhy (± kg od poslední váhy)") },
+                        label = { Text("Tolerance plovoucího filtru váhy (± kg)") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
@@ -237,34 +274,84 @@ fun SettingsTabContent(
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Text(
-                                text = "Aktuální kalibrace: ${FormatUtils.twoDecimals(cfg.referenceWeightKg)} kg",
-                                style = MaterialTheme.typography.bodySmall
+                                text = "Referenční váha: ${FormatUtils.twoDecimals(cfg.referenceWeightKg)} kg",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             TextButton(onClick = { bridge.resetWeightCalibration() }) {
-                                Text("Vynulovat kalibraci")
+                                Text("Reset kalibrace")
                             }
                         }
                     }
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         OutlinedTextField(
-                            value = gluMinText,
-                            onValueChange = { gluMinText = it },
-                            label = { Text("Cíl glukóza min") },
+                            value = minGlucoseText,
+                            onValueChange = { minGlucoseText = it },
+                            label = { Text("Cukr min (mmol/L)") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                             singleLine = true,
                             modifier = Modifier.weight(1f)
                         )
                         OutlinedTextField(
-                            value = gluMaxText,
-                            onValueChange = { gluMaxText = it },
-                            label = { Text("Cíl glukóza max") },
+                            value = maxGlucoseText,
+                            onValueChange = { maxGlucoseText = it },
+                            label = { Text("Cukr max (mmol/L)") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                             singleLine = true,
                             modifier = Modifier.weight(1f)
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                            Text(
+                                text = "Zapisovat složení těla do HC",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "Tuk, svalová a kostní hmota, voda a bazální metabolismus",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = writeComposition,
+                            onCheckedChange = { writeComposition = it }
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                            Text(
+                                text = "Tiché hlídání glukometru na pozadí",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "Automatický přenos při zapnutí Contouru bez ikony v liště",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = bgWatchEnabled,
+                            onCheckedChange = {
+                                bgWatchEnabled = it
+                                bridge.setBackgroundServiceEnabled(it)
+                            }
                         )
                     }
                 }
@@ -275,7 +362,7 @@ fun SettingsTabContent(
             Card(shape = RoundedCornerShape(20.dp)) {
                 Column(
                     modifier = Modifier.fillMaxWidth().padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(
                         text = "Tuya IoT Core (váha Tesla BF1321)",
@@ -288,8 +375,8 @@ fun SettingsTabContent(
                             onClick = {
                                 scope.launch {
                                     credentialBridge.loadCredentials()?.let { (savedId, savedSecret) ->
-                                        accessId = savedId
-                                        accessSecret = savedSecret
+                                        accessIdText = savedId
+                                        accessSecretText = savedSecret
                                     }
                                 }
                             },
@@ -297,89 +384,68 @@ fun SettingsTabContent(
                             shape = RoundedCornerShape(14.dp)
                         ) {
                             Icon(Icons.Default.Key, contentDescription = null)
-                            Spacer(Modifier.width(6.dp))
+                            Spacer(Modifier.width(8.dp))
                             Text("🔑 Vyplnit uložený účet")
                         }
                     }
 
                     OutlinedTextField(
-                        value = accessId,
-                        onValueChange = { accessId = it },
+                        value = accessIdText,
+                        onValueChange = { accessIdText = it },
                         label = { Text("Tuya Access ID") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
 
                     OutlinedTextField(
-                        value = accessSecret,
-                        onValueChange = { accessSecret = it },
+                        value = accessSecretText,
+                        onValueChange = { accessSecretText = it },
                         label = { Text("Tuya Access Secret") },
                         singleLine = true,
-                        visualTransformation = if (showSecret) VisualTransformation.None else PasswordVisualTransformation(),
+                        visualTransformation = if (showSecret) {
+                            VisualTransformation.None
+                        } else {
+                            PasswordVisualTransformation()
+                        },
                         trailingIcon = {
                             IconButton(onClick = { showSecret = !showSecret }) {
                                 Icon(
                                     imageVector = if (showSecret) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                                    contentDescription = null
+                                    contentDescription = if (showSecret) "Skrýt" else "Zobrazit"
                                 )
                             }
                         },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                         modifier = Modifier.fillMaxWidth()
                     )
 
                     OutlinedTextField(
-                        value = deviceId,
-                        onValueChange = { deviceId = it },
+                        value = deviceIdText,
+                        onValueChange = { deviceIdText = it },
                         label = { Text("Device ID váhy") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
 
                     OutlinedTextField(
-                        value = endpoint,
-                        onValueChange = { endpoint = it },
+                        value = endpointText,
+                        onValueChange = { endpointText = it },
                         label = { Text("Tuya Endpoint (EU)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
 
                     Button(
-                        onClick = {
-                            val updated = cfg.copy(
-                                tuyaAccessId = accessId.trim(),
-                                tuyaAccessSecret = accessSecret.trim(),
-                                tuyaDeviceId = deviceId.trim().ifBlank { "00821002c45bbee6ebbe" },
-                                tuyaEndpoint = endpoint.trim().ifBlank { "https://openapi.tuyaeu.com" },
-                                heightCm = heightText.trim().toIntOrNull()?.coerceIn(110, 230) ?: cfg.heightCm,
-                                birthYear = birthYearText.trim().toIntOrNull()?.coerceIn(1925, 2020) ?: cfg.birthYear,
-                                isMale = isMale,
-                                writeBodyCompositionToHc = writeBodyComp,
-                                weightToleranceKg = toleranceText.replace(',', '.').trim().toDoubleOrNull()?.coerceIn(2.0, 50.0)
-                                    ?: cfg.weightToleranceKg,
-                                targetGlucoseMin = gluMinText.replace(',', '.').trim().toDoubleOrNull()?.coerceIn(2.0, 10.0)
-                                    ?: cfg.targetGlucoseMin,
-                                targetGlucoseMax = gluMaxText.replace(',', '.').trim().toDoubleOrNull()?.coerceIn(4.0, 20.0)
-                                    ?: cfg.targetGlucoseMax
-                            )
-                            bridge.saveScaleConfig(updated)
-                            savedBanner = true
-                            if (credentialBridge.isSupported && updated.tuyaAccessId.isNotBlank() && updated.tuyaAccessSecret.isNotBlank()) {
-                                scope.launch {
-                                    credentialBridge.saveCredentials(updated.tuyaAccessId, updated.tuyaAccessSecret)
-                                }
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                        shape = RoundedCornerShape(14.dp)
+                        onClick = saveAllSettings,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp),
+                        shape = RoundedCornerShape(16.dp)
                     ) {
-                        Text("Uložit veškeré nastavení")
+                        Text("Uložit veškeré nastavení", fontWeight = FontWeight.Bold)
                     }
 
-                    if (savedBanner) {
+                    if (saveFeedback.isNotBlank()) {
                         Text(
-                            text = "Nastavení bylo uloženo v telefonu.",
-                            style = MaterialTheme.typography.bodySmall,
+                            text = saveFeedback,
+                            style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Bold,
                             color = Color(0xFF1B8755)
                         )
@@ -393,7 +459,8 @@ fun SettingsTabContent(
                             Text(
                                 text = uiState.tuyaDiagnosticLog,
                                 style = MaterialTheme.typography.bodySmall,
-                                modifier = Modifier.fillMaxWidth().padding(10.dp)
+                                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }
@@ -401,30 +468,34 @@ fun SettingsTabContent(
             }
         }
 
-        if (uiState.pairedMeterAddress != null) {
-            item {
-                Card(shape = RoundedCornerShape(20.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(16.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = uiState.pairedMeterName ?: "Contour Plus One",
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Text(
-                                text = "MAC: ${uiState.pairedMeterAddress}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
+        item {
+            Card(shape = RoundedCornerShape(20.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                        Text(
+                            text = uiState.pairedMeterName ?: "Glukometr nespárován",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = if (!uiState.pairedMeterAddress.isNullOrBlank()) {
+                                "MAC: ${uiState.pairedMeterAddress}"
+                            } else {
+                                "Spáruj Contour Plus One na kartě Cukr"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    if (!uiState.pairedMeterAddress.isNullOrBlank()) {
                         OutlinedButton(
                             onClick = { bridge.unpairContourMeter() },
                             modifier = Modifier.heightIn(min = 48.dp),
-                            shape = RoundedCornerShape(12.dp)
+                            shape = RoundedCornerShape(14.dp)
                         ) {
                             Icon(Icons.Default.BluetoothDisabled, contentDescription = null)
                             Spacer(Modifier.width(6.dp))
@@ -438,7 +509,7 @@ fun SettingsTabContent(
         item {
             Text(
                 text = "© 2026 Created by Pavel Mareš",
-                style = MaterialTheme.typography.labelMedium,
+                style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)

@@ -38,248 +38,310 @@ data class HcSyncResult(
 
 object HealthConnectManager {
 
-    private val P_READ_GLU = HealthPermission.getReadPermission(BloodGlucoseRecord::class)
-    private val P_WRITE_GLU = HealthPermission.getWritePermission(BloodGlucoseRecord::class)
-    private val P_READ_WEIGHT = HealthPermission.getReadPermission(WeightRecord::class)
-    private val P_WRITE_WEIGHT = HealthPermission.getWritePermission(WeightRecord::class)
-    private val P_READ_FAT = HealthPermission.getReadPermission(BodyFatRecord::class)
-    private val P_WRITE_FAT = HealthPermission.getWritePermission(BodyFatRecord::class)
-    private val P_READ_LBM = HealthPermission.getReadPermission(LeanBodyMassRecord::class)
-    private val P_WRITE_LBM = HealthPermission.getWritePermission(LeanBodyMassRecord::class)
-    private val P_READ_BONE = HealthPermission.getReadPermission(BoneMassRecord::class)
-    private val P_WRITE_BONE = HealthPermission.getWritePermission(BoneMassRecord::class)
-    private val P_READ_WATER = HealthPermission.getReadPermission(BodyWaterMassRecord::class)
-    private val P_WRITE_WATER = HealthPermission.getWritePermission(BodyWaterMassRecord::class)
-    private val P_READ_BMR = HealthPermission.getReadPermission(BasalMetabolicRateRecord::class)
-    private val P_WRITE_BMR = HealthPermission.getWritePermission(BasalMetabolicRateRecord::class)
-    private val P_READ_HEIGHT = HealthPermission.getReadPermission(HeightRecord::class)
-    private val P_WRITE_HEIGHT = HealthPermission.getWritePermission(HeightRecord::class)
+    private val CORE_PERMISSIONS = setOf(
+        HealthPermission.getReadPermission(BloodGlucoseRecord::class),
+        HealthPermission.getWritePermission(BloodGlucoseRecord::class),
+        HealthPermission.getReadPermission(WeightRecord::class),
+        HealthPermission.getWritePermission(WeightRecord::class)
+    )
 
-    val REQUIRED_PERMISSIONS: Set<String> = setOf(
-        P_READ_GLU, P_WRITE_GLU,
-        P_READ_WEIGHT, P_WRITE_WEIGHT,
-        P_READ_FAT, P_WRITE_FAT,
-        P_READ_LBM, P_WRITE_LBM,
-        P_READ_BONE, P_WRITE_BONE,
-        P_READ_WATER, P_WRITE_WATER,
-        P_READ_BMR, P_WRITE_BMR,
-        P_READ_HEIGHT, P_WRITE_HEIGHT
+    val REQUIRED_PERMISSIONS: Set<String> = CORE_PERMISSIONS + setOf(
+        HealthPermission.getReadPermission(BodyFatRecord::class),
+        HealthPermission.getWritePermission(BodyFatRecord::class),
+        HealthPermission.getReadPermission(LeanBodyMassRecord::class),
+        HealthPermission.getWritePermission(LeanBodyMassRecord::class),
+        HealthPermission.getReadPermission(BoneMassRecord::class),
+        HealthPermission.getWritePermission(BoneMassRecord::class),
+        HealthPermission.getReadPermission(BodyWaterMassRecord::class),
+        HealthPermission.getWritePermission(BodyWaterMassRecord::class),
+        HealthPermission.getReadPermission(BasalMetabolicRateRecord::class),
+        HealthPermission.getWritePermission(BasalMetabolicRateRecord::class),
+        HealthPermission.getReadPermission(HeightRecord::class),
+        HealthPermission.getWritePermission(HeightRecord::class)
     )
 
     suspend fun checkStatus(context: Context): HcStatusInfo {
-        val sdkStatus = HealthConnectClient.getSdkStatus(context)
-        if (sdkStatus != HealthConnectClient.SDK_AVAILABLE) {
+        val status = HealthConnectClient.getSdkStatus(context)
+        if (status != HealthConnectClient.SDK_AVAILABLE) {
             return HcStatusInfo(
                 available = false,
                 allCoreGranted = false,
-                detailText = "Služba Health Connect není v systému dostupná nebo vyžaduje aktualizaci."
+                detailText = "Služba Health Connect není v telefonu nainstalovaná nebo vyžaduje aktualizaci."
             )
         }
         return try {
             val client = HealthConnectClient.getOrCreate(context)
             val granted = client.permissionController.getGrantedPermissions()
-            val hasCore = P_WRITE_GLU in granted && P_WRITE_WEIGHT in granted
-            val hasAll = granted.containsAll(REQUIRED_PERMISSIONS)
-            val detail = when {
-                hasAll -> "Plný přístup povolen (glukóza, váha i kompletní složení těla)."
-                hasCore -> "Základní zápis povolen (${granted.size}/${REQUIRED_PERMISSIONS.size} oprávnění)."
-                else -> "Chybí povolení k zápisu do Health Connect. Klepni na Povolit zápis."
+            val coreOk = granted.containsAll(CORE_PERMISSIONS)
+            val fullOk = granted.containsAll(REQUIRED_PERMISSIONS)
+            val text = when {
+                fullOk -> "Plný přístup povolen (glukóza, váha i kompletní složení těla)."
+                coreOk -> "Základní přístup povolen (glukóza a váha). Pro tuk a svaly povol i ostatní položky."
+                else -> "Povol oprávnění zápisu do Health Connect pro přenos do Samsung Health."
             }
             HcStatusInfo(
                 available = true,
-                allCoreGranted = hasCore,
-                detailText = detail
+                allCoreGranted = coreOk,
+                detailText = text
             )
         } catch (t: Throwable) {
             HcStatusInfo(
                 available = true,
                 allCoreGranted = false,
-                detailText = "Kontrola Health Connect: ${t.message ?: "vyžaduje povolení"}"
+                detailText = "Kontrola oprávnění Health Connect: ${t.message ?: "nepodařila se"}"
             )
         }
     }
 
     fun openHealthConnectSettings(context: Context) {
-        val pkg = context.packageName
-        val candidates = listOf(
-            Intent("android.health.connect.action.MANAGE_HEALTH_PERMISSIONS").apply {
-                putExtra(Intent.EXTRA_PACKAGE_NAME, pkg)
-            },
-            Intent("androidx.health.ACTION_MANAGE_HEALTH_PERMISSIONS").apply {
-                putExtra(Intent.EXTRA_PACKAGE_NAME, pkg)
-            },
+        val intents = listOf(
             Intent("androidx.health.ACTION_HEALTH_CONNECT_SETTINGS"),
-            Intent("android.health.connect.action.HEALTH_CONNECT_SETTINGS")
+            Intent(HealthConnectClient.ACTION_HEALTH_CONNECT_SETTINGS),
+            context.packageManager.getLaunchIntentForPackage("com.google.android.apps.healthdata"),
+            Intent(
+                Intent.ACTION_VIEW,
+                Uri.parse("market://details?id=com.google.android.apps.healthdata")
+            )
         )
-        for (intent in candidates) {
+        for (candidate in intents.filterNotNull()) {
             try {
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                context.startActivity(intent)
+                candidate.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(candidate)
                 return
             } catch (_: Throwable) {
             }
         }
-        try {
-            val fallback = Intent(
-                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                Uri.fromParts("package", pkg, null)
-            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            context.startActivity(fallback)
-        } catch (_: Throwable) {
-        }
     }
 
     suspend fun syncRecords(context: Context, forceAll: Boolean = false): HcSyncResult {
-        if (HealthConnectClient.getSdkStatus(context) != HealthConnectClient.SDK_AVAILABLE) {
-            return HcSyncResult(0, 0, "Health Connect není v telefonu dostupný.")
+        val sdkStatus = HealthConnectClient.getSdkStatus(context)
+        if (sdkStatus != HealthConnectClient.SDK_AVAILABLE) {
+            return HcSyncResult(0, 0, "Health Connect není v zařízení dostupný.")
         }
 
-        return try {
-            val client = HealthConnectClient.getOrCreate(context)
-            val granted = client.permissionController.getGrantedPermissions()
-            val canWriteGlu = P_WRITE_GLU in granted
-            val canWriteWeight = P_WRITE_WEIGHT in granted
+        val client = try {
+            HealthConnectClient.getOrCreate(context)
+        } catch (t: Throwable) {
+            return HcSyncResult(0, 0, "Nelze otevřít Health Connect: ${t.message}")
+        }
 
-            if (!canWriteGlu && !canWriteWeight) {
-                return HcSyncResult(
-                    glucoseWritten = 0,
-                    scaleWritten = 0,
-                    message = "Nejprve povol zápis v Health Connect."
-                )
-            }
+        val granted = try {
+            client.permissionController.getGrantedPermissions()
+        } catch (t: Throwable) {
+            return HcSyncResult(0, 0, "Nelze ověřit oprávnění Health Connect: ${t.message}")
+        }
 
-            val cfg = LocalHealthStore.loadConfig(context)
-            val zone = ZoneId.systemDefault()
-            var gluCount = 0
-            var scaleCount = 0
+        val canWriteGlucose = granted.contains(HealthPermission.getWritePermission(BloodGlucoseRecord::class))
+        val canWriteWeight = granted.contains(HealthPermission.getWritePermission(WeightRecord::class))
+        if (!canWriteGlucose && !canWriteWeight) {
+            return HcSyncResult(0, 0, "Nejprve v Nastavení povol zápis do Health Connect.")
+        }
 
-            if (canWriteGlu) {
-                val toSendGlu = LocalHealthStore.loadGlucoseList(context)
-                    .filter { forceAll || !it.syncedToHealthConnect }
-                val syncedGluIds = HashSet<String>()
+        val cfg = LocalHealthStore.loadConfig(context)
+        val glucosePending = LocalHealthStore.loadGlucoseList(context)
+            .filter { forceAll || !it.syncedToHealthConnect }
+        val scalePending = LocalHealthStore.loadScaleList(context)
+            .filter { forceAll || !it.syncedToHealthConnect }
 
-                for (entry in toSendGlu) {
-                    val instant = Instant.ofEpochMilli(entry.timestampMillis)
-                    val offset = zone.rules.getOffset(instant)
-                    val relation = when (entry.mealRelation) {
-                        MealRelation.FASTING -> BloodGlucoseRecord.RELATION_TO_MEAL_FASTING
-                        MealRelation.BEFORE_MEAL -> BloodGlucoseRecord.RELATION_TO_MEAL_BEFORE_MEAL
-                        MealRelation.AFTER_MEAL -> BloodGlucoseRecord.RELATION_TO_MEAL_AFTER_MEAL
-                        MealRelation.GENERAL -> BloodGlucoseRecord.RELATION_TO_MEAL_GENERAL
+        var glucoseOkCount = 0
+        var scaleOkCount = 0
+        val errors = ArrayList<String>()
+
+        if (canWriteGlucose && glucosePending.isNotEmpty()) {
+            val syncedIds = ArrayList<String>()
+            for (entry in glucosePending) {
+                try {
+                    val time = safeRecordInstant(entry.timestampMillis)
+                    val zoneOffset = ZoneId.systemDefault().rules.getOffset(time)
+                    val relation = when (entry.mealRelation.name.uppercase()) {
+                        "FASTING" -> BloodGlucoseRecord.RELATION_TO_MEAL_FASTING
+                        "BEFORE_MEAL", "PREPRANDIAL" -> BloodGlucoseRecord.RELATION_TO_MEAL_BEFORE_MEAL
+                        "AFTER_MEAL", "POSTPRANDIAL" -> BloodGlucoseRecord.RELATION_TO_MEAL_AFTER_MEAL
+                        else -> BloodGlucoseRecord.RELATION_TO_MEAL_GENERAL
                     }
                     val record = BloodGlucoseRecord(
-                        time = instant,
-                        zoneOffset = offset,
-                        level = BloodGlucose.millimolesPerLiter(entry.mmolPerLiter),
+                        time = time,
+                        zoneOffset = zoneOffset,
+                        level = BloodGlucose.millimolesPerLiter(entry.mmolPerLiter.coerceIn(1.0, 45.0)),
                         specimenSource = BloodGlucoseRecord.SPECIMEN_SOURCE_CAPILLARY_BLOOD,
                         mealType = MealType.MEAL_TYPE_UNKNOWN,
                         relationToMeal = relation,
-                        metadata = Metadata(clientRecordId = "zpm_glu_${entry.id}")
-                    )
-                    client.insertRecords(listOf(record))
-                    syncedGluIds.add(entry.id)
-                    gluCount++
-                }
-                LocalHealthStore.markGlucoseSynced(context, syncedGluIds)
-            }
-
-            if (canWriteWeight) {
-                val toSendScale = LocalHealthStore.loadScaleList(context)
-                    .filter { forceAll || !it.syncedToHealthConnect }
-                val syncedScaleIds = HashSet<String>()
-
-                for (entry in toSendScale) {
-                    val instant = Instant.ofEpochMilli(entry.timestampMillis)
-                    val offset = zone.rules.getOffset(instant)
-                    val batch = ArrayList<Record>()
-
-                    batch.add(
-                        WeightRecord(
-                            time = instant,
-                            zoneOffset = offset,
-                            weight = Mass.kilograms(entry.weightKg),
-                            metadata = Metadata(clientRecordId = "zpm_w_${entry.id}")
+                        metadata = Metadata(
+                            clientRecordId = entry.id,
+                            clientRecordVersion = 1L
                         )
                     )
+                    client.insertRecords(listOf(record))
+                    syncedIds.add(entry.id)
+                    glucoseOkCount++
+                } catch (t: Throwable) {
+                    if (errors.isEmpty()) {
+                        errors.add("Cukr: ${t.message ?: "chyba zápisu"}")
+                    }
+                }
+            }
+            if (syncedIds.isNotEmpty()) {
+                LocalHealthStore.markGlucoseSynced(context, syncedIds)
+            }
+        }
+
+        if (canWriteWeight && scalePending.isNotEmpty()) {
+            val syncedScaleIds = ArrayList<String>()
+            var heightWrittenOnce = false
+
+            for (entry in scalePending) {
+                try {
+                    val time = safeRecordInstant(entry.timestampMillis)
+                    val zoneOffset = ZoneId.systemDefault().rules.getOffset(time)
+                    val recVersion = if (entry.impedanceOhms != null) 2L else 1L
+
+                    val weightRec = WeightRecord(
+                        time = time,
+                        zoneOffset = zoneOffset,
+                        weight = Mass.kilograms(entry.weightKg.coerceIn(10.0, 350.0)),
+                        metadata = Metadata(
+                            clientRecordId = "${entry.id}_weight",
+                            clientRecordVersion = recVersion
+                        )
+                    )
+                    client.insertRecords(listOf(weightRec))
+                    syncedScaleIds.add(entry.id)
+                    scaleOkCount++
 
                     if (cfg.writeBodyCompositionToHc) {
-                        if (entry.bodyFatPercent != null && P_WRITE_FAT in granted) {
-                            batch.add(
+                        val extraRecords = ArrayList<Record>()
+                        if (entry.bodyFatPercent != null &&
+                            granted.contains(HealthPermission.getWritePermission(BodyFatRecord::class))
+                        ) {
+                            extraRecords.add(
                                 BodyFatRecord(
-                                    time = instant,
-                                    zoneOffset = offset,
-                                    percentage = Percentage(entry.bodyFatPercent),
-                                    metadata = Metadata(clientRecordId = "zpm_bf_${entry.id}")
+                                    time = time,
+                                    zoneOffset = zoneOffset,
+                                    percentage = Percentage(entry.bodyFatPercent.coerceIn(1.0, 75.0)),
+                                    metadata = Metadata(
+                                        clientRecordId = "${entry.id}_fat",
+                                        clientRecordVersion = recVersion
+                                    )
                                 )
                             )
                         }
-                        if (entry.leanBodyMassKg != null && P_WRITE_LBM in granted) {
-                            batch.add(
+                        if (entry.leanBodyMassKg != null &&
+                            granted.contains(HealthPermission.getWritePermission(LeanBodyMassRecord::class))
+                        ) {
+                            extraRecords.add(
                                 LeanBodyMassRecord(
-                                    time = instant,
-                                    zoneOffset = offset,
-                                    mass = Mass.kilograms(entry.leanBodyMassKg),
-                                    metadata = Metadata(clientRecordId = "zpm_lbm_${entry.id}")
+                                    time = time,
+                                    zoneOffset = zoneOffset,
+                                    mass = Mass.kilograms(entry.leanBodyMassKg.coerceIn(10.0, 250.0)),
+                                    metadata = Metadata(
+                                        clientRecordId = "${entry.id}_lbm",
+                                        clientRecordVersion = recVersion
+                                    )
                                 )
                             )
                         }
-                        if (entry.boneMassKg != null && P_WRITE_BONE in granted) {
-                            batch.add(
+                        if (entry.boneMassKg != null &&
+                            granted.contains(HealthPermission.getWritePermission(BoneMassRecord::class))
+                        ) {
+                            extraRecords.add(
                                 BoneMassRecord(
-                                    time = instant,
-                                    zoneOffset = offset,
-                                    mass = Mass.kilograms(entry.boneMassKg),
-                                    metadata = Metadata(clientRecordId = "zpm_bone_${entry.id}")
+                                    time = time,
+                                    zoneOffset = zoneOffset,
+                                    mass = Mass.kilograms(entry.boneMassKg.coerceIn(0.5, 15.0)),
+                                    metadata = Metadata(
+                                        clientRecordId = "${entry.id}_bone",
+                                        clientRecordVersion = recVersion
+                                    )
                                 )
                             )
                         }
-                        if (entry.bodyWaterKg != null && P_WRITE_WATER in granted) {
-                            batch.add(
+                        if (entry.bodyWaterKg != null &&
+                            granted.contains(HealthPermission.getWritePermission(BodyWaterMassRecord::class))
+                        ) {
+                            extraRecords.add(
                                 BodyWaterMassRecord(
-                                    time = instant,
-                                    zoneOffset = offset,
-                                    mass = Mass.kilograms(entry.bodyWaterKg),
-                                    metadata = Metadata(clientRecordId = "zpm_water_${entry.id}")
+                                    time = time,
+                                    zoneOffset = zoneOffset,
+                                    mass = Mass.kilograms(entry.bodyWaterKg.coerceIn(10.0, 200.0)),
+                                    metadata = Metadata(
+                                        clientRecordId = "${entry.id}_water",
+                                        clientRecordVersion = recVersion
+                                    )
                                 )
                             )
                         }
-                        if (entry.bmrKcal != null && P_WRITE_BMR in granted) {
-                            batch.add(
+                        if (entry.bmrKcal != null &&
+                            granted.contains(HealthPermission.getWritePermission(BasalMetabolicRateRecord::class))
+                        ) {
+                            extraRecords.add(
                                 BasalMetabolicRateRecord(
-                                    time = instant,
-                                    zoneOffset = offset,
-                                    basalMetabolicRate = Power.kilocaloriesPerDay(entry.bmrKcal.toDouble()),
-                                    metadata = Metadata(clientRecordId = "zpm_bmr_${entry.id}")
+                                    time = time,
+                                    zoneOffset = zoneOffset,
+                                    basalMetabolicRate = Power.kilocaloriesPerDay(
+                                        entry.bmrKcal.toDouble().coerceIn(500.0, 6000.0)
+                                    ),
+                                    metadata = Metadata(
+                                        clientRecordId = "${entry.id}_bmr",
+                                        clientRecordVersion = recVersion
+                                    )
                                 )
                             )
                         }
-                        if (P_WRITE_HEIGHT in granted) {
-                            batch.add(
+                        if (!heightWrittenOnce &&
+                            granted.contains(HealthPermission.getWritePermission(HeightRecord::class))
+                        ) {
+                            val heightMeters = (cfg.heightCm.toDouble() / 100.0).coerceIn(0.8, 2.4)
+                            extraRecords.add(
                                 HeightRecord(
-                                    time = instant,
-                                    zoneOffset = offset,
-                                    height = Length.meters(cfg.heightCm.coerceIn(110, 230) / 100.0),
-                                    metadata = Metadata(clientRecordId = "zpm_h_${entry.id}")
+                                    time = time,
+                                    zoneOffset = zoneOffset,
+                                    height = Length.meters(heightMeters),
+                                    metadata = Metadata(
+                                        clientRecordId = "zdravipm_user_height",
+                                        clientRecordVersion = 1L
+                                    )
                                 )
                             )
+                            heightWrittenOnce = true
+                        }
+
+                        for (extra in extraRecords) {
+                            try {
+                                client.insertRecords(listOf(extra))
+                            } catch (_: Throwable) {
+                            }
                         }
                     }
-
-                    client.insertRecords(batch)
-                    syncedScaleIds.add(entry.id)
-                    scaleCount++
+                } catch (t: Throwable) {
+                    errors.add("Váha: ${t.message ?: "chyba zápisu"}")
                 }
+            }
+            if (syncedScaleIds.isNotEmpty()) {
                 LocalHealthStore.markScaleSynced(context, syncedScaleIds)
             }
-
-            val msg = if (gluCount == 0 && scaleCount == 0) {
-                "Všechny záznamy jsou již v Health Connect aktuální."
-            } else {
-                "Zapsáno do Health Connect: $gluCount× cukr, $scaleCount× váha a složení těla."
-            }
-            HcSyncResult(gluCount, scaleCount, msg)
-        } catch (t: Throwable) {
-            HcSyncResult(0, 0, "Chyba zápisu do Health Connect: ${t.message ?: "neznámá chyba"}")
         }
+
+        val summary = when {
+            errors.isNotEmpty() && (glucoseOkCount > 0 || scaleOkCount > 0) ->
+                "Zapsáno (cukr: $glucoseOkCount×, váha: $scaleOkCount×), upozornění: ${errors.first()}"
+            errors.isNotEmpty() ->
+                "Chyba zápisu do Health Connect: ${errors.first()}"
+            glucoseOkCount == 0 && scaleOkCount == 0 ->
+                "Všechny záznamy už jsou synchronizované v Health Connect."
+            else ->
+                "Úspěšně zapsáno do Health Connect (cukr: $glucoseOkCount×, váha a tělo: $scaleOkCount×)."
+        }
+
+        return HcSyncResult(
+            glucoseWritten = glucoseOkCount,
+            scaleWritten = scaleOkCount,
+            message = summary
+        )
+    }
+
+    private fun safeRecordInstant(rawMillis: Long): Instant {
+        val maxAllowed = System.currentTimeMillis() - 2_000L
+        val clamped = rawMillis.coerceIn(946_684_800_000L, maxAllowed)
+        return Instant.ofEpochMilli(clamped)
     }
 }

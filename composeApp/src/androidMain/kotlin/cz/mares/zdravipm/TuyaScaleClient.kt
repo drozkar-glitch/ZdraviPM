@@ -97,7 +97,7 @@ object TuyaScaleClient {
             meta.weightCodes.forEach { weightCodes.add(it) }
             meta.ohmsCodes.forEach { ohmsCodes.add(it) }
 
-            // 1. IoT Core v2.0 shadow/properties - aktualni stav vahy a presne nazvy DP
+            // 1. IoT Core v2.0 shadow/properties - aktualni stav vahy (weight + BR)
             val shadowResp = executeSignedGet(
                 baseUrl = baseUrl,
                 path = "/v2.0/cloud/thing/$deviceId/shadow/properties",
@@ -118,12 +118,16 @@ object TuyaScaleClient {
                 val fallbackShadowTs = normalizeTimestamp(shadowResp.optLong("t", System.currentTimeMillis()))
                 val dpSummary = ArrayList<String>()
 
+                var shadowWeightKg: Double? = null
+                var shadowWeightRawTs = 0L
+                var shadowOhms: Int? = null
+                var shadowOhmsRawTs = 0L
+
                 for (i in 0 until props.length()) {
                     val p = props.optJSONObject(i) ?: continue
                     val code = p.optString("code", "").trim()
                     val rawVal = p.opt("value")?.toString()?.trim().orEmpty()
-                    val propTime = normalizeTimestamp(p.optLong("time", 0L))
-                        .takeIf { it > 0L } ?: fallbackShadowTs
+                    val rawPropTs = normalizeTimestamp(p.optLong("time", 0L))
 
                     if (code.isNotEmpty()) {
                         dpSummary.add("$code=$rawVal")
@@ -131,15 +135,32 @@ object TuyaScaleClient {
                     if (isWeightCode(code)) {
                         weightCodes.add(code)
                         parseWeightKg(rawVal, specScale, specUnit)?.let { kg ->
-                            allWeightEvents.add(propTime to kg)
+                            shadowWeightKg = kg
+                            shadowWeightRawTs = rawPropTs
                         }
                     } else if (isOhmsCode(code)) {
                         ohmsCodes.add(code)
                         parseOhms(rawVal)?.let { ohms ->
-                            allOhmsEvents.add(propTime to ohms)
+                            shadowOhms = ohms
+                            shadowOhmsRawTs = rawPropTs
                         }
                     }
                 }
+
+                val effectiveWeightTs = if (shadowWeightRawTs > 0L) shadowWeightRawTs else fallbackShadowTs
+                shadowWeightKg?.let { kg ->
+                    allWeightEvents.add(effectiveWeightTs to kg)
+                }
+                shadowOhms?.let { ohms ->
+                    val effectiveOhmsTs = when {
+                        shadowOhmsRawTs > 0L && shadowWeightRawTs > 0L &&
+                            abs(shadowOhmsRawTs - shadowWeightRawTs) <= 120_000L -> effectiveWeightTs
+                        shadowOhmsRawTs == 0L -> effectiveWeightTs
+                        else -> shadowOhmsRawTs
+                    }
+                    allOhmsEvents.add(effectiveOhmsTs to ohms)
+                }
+
                 diagLines.add(
                     "Shadow DPs (${props.length()}): ${dpSummary.joinToString(", ").ifBlank { "žádné" }}"
                 )
@@ -150,7 +171,7 @@ object TuyaScaleClient {
                 diagLines.add("shadow/properties ($code): $msg")
             }
 
-            // 2. Zalozni status pres IoT Core v1.0/iot-03 pokud shadow neuspelo
+            // 2. Zalozni status pokud shadow neuspelo
             if (!anyDataEndpointOk) {
                 for (statusPath in listOf(
                     "/v1.0/iot-03/devices/$deviceId/status",
@@ -169,12 +190,10 @@ object TuyaScaleClient {
                         anyDataEndpointOk = true
                         val stArr = stResp.optJSONArray("result") ?: JSONArray()
                         val fallbackTs = normalizeTimestamp(stResp.optLong("t", System.currentTimeMillis()))
-                        val stSummary = ArrayList<String>()
                         for (i in 0 until stArr.length()) {
                             val item = stArr.optJSONObject(i) ?: continue
                             val code = item.optString("code", "").trim()
                             val rawVal = item.opt("value")?.toString()?.trim().orEmpty()
-                            if (code.isNotEmpty()) stSummary.add("$code=$rawVal")
                             if (isWeightCode(code)) {
                                 weightCodes.add(code)
                                 parseWeightKg(rawVal, specScale, specUnit)?.let {
@@ -187,7 +206,7 @@ object TuyaScaleClient {
                                 }
                             }
                         }
-                        diagLines.add("$statusPath: ${stSummary.joinToString(", ").ifBlank { "prázdné" }}")
+                        diagLines.add("$statusPath: přijato ${stArr.length()} stavů")
                         break
                     }
                 }
@@ -195,18 +214,18 @@ object TuyaScaleClient {
 
             if (weightCodes.isEmpty()) {
                 weightCodes.add("weight")
-                weightCodes.add("weight_s")
             }
             if (ohmsCodes.isEmpty()) {
+                ohmsCodes.add("BR")
                 ohmsCodes.add("Body_R")
             }
 
-            // 3. Historie vazeni pres IoT Core v2.0 report-logs (bez carky v parametru codes)
-            val now = System.currentTimeMillis() + timeSkewMs
+            // 3. Historie vazeni pres IoT Core v2.0 report-logs po jednotlivych kodech (weight a BR)
+            val now = System.currentTimeMillis() + timeSkewMs - 1_000L
             val sixDaysMs = 6L * 24L * 3600L * 1000L
             var v2ReportLogsOk = false
 
-            for (wCode in weightCodes.take(3)) {
+            for (wCode in weightCodes.take(2)) {
                 val wParams = TreeMap<String, String>().apply {
                     put("codes", wCode)
                     put("end_time", now.toString())
@@ -231,9 +250,7 @@ object TuyaScaleClient {
                 } else {
                     val c = wResp.optInt("code", -1)
                     val m = wResp.optString("msg", "")
-                    apiErrors.add("report-logs ($c: $m)")
                     diagLines.add("v2 report-logs [$wCode] ($c): $m")
-                    break
                 }
             }
 
@@ -257,57 +274,30 @@ object TuyaScaleClient {
                     if (rResp.optBoolean("success", false)) {
                         val rLogs = extractLogsArray(rResp.opt("result"))
                         parseLogsIntoLists(rLogs, specScale, specUnit, allWeightEvents, allOhmsEvents)
+                        diagLines.add("v2 report-logs [$rCode]: ${rLogs.length()} záznamů")
                     }
                 }
             } else {
-                // 4. Zalozni historie pres iot-03/report-logs nebo v1.0/devices/logs
-                val primaryWCode = weightCodes.first()
-                val iot03Params = TreeMap<String, String>().apply {
-                    put("codes", primaryWCode)
+                val v1Params = TreeMap<String, String>().apply {
                     put("end_time", now.toString())
-                    put("size", "50")
+                    put("size", "100")
                     put("start_time", (now - sixDaysMs).toString())
+                    put("type", "7")
                 }
-                val iot03Resp = executeSignedGet(
+                val v1Resp = executeSignedGet(
                     baseUrl = baseUrl,
-                    path = "/v1.0/iot-03/devices/$deviceId/report-logs",
-                    queryParams = iot03Params,
+                    path = "/v1.0/devices/$deviceId/logs",
+                    queryParams = v1Params,
                     accessId = accessId,
                     accessSecret = secret,
                     accessToken = token,
                     timeSkewMs = timeSkewMs
                 )
-                if (iot03Resp.optBoolean("success", false)) {
+                if (v1Resp.optBoolean("success", false)) {
                     anyDataEndpointOk = true
-                    val arr = extractLogsArray(iot03Resp.opt("result"))
+                    val arr = extractLogsArray(v1Resp.opt("result"))
                     parseLogsIntoLists(arr, specScale, specUnit, allWeightEvents, allOhmsEvents)
-                    diagLines.add("iot-03 report-logs: ${arr.length()} záznamů")
-                } else {
-                    val v1Params = TreeMap<String, String>().apply {
-                        put("end_time", now.toString())
-                        put("size", "100")
-                        put("start_time", (now - sixDaysMs).toString())
-                        put("type", "7")
-                    }
-                    val v1Resp = executeSignedGet(
-                        baseUrl = baseUrl,
-                        path = "/v1.0/devices/$deviceId/logs",
-                        queryParams = v1Params,
-                        accessId = accessId,
-                        accessSecret = secret,
-                        accessToken = token,
-                        timeSkewMs = timeSkewMs
-                    )
-                    if (v1Resp.optBoolean("success", false)) {
-                        anyDataEndpointOk = true
-                        val arr = extractLogsArray(v1Resp.opt("result"))
-                        parseLogsIntoLists(arr, specScale, specUnit, allWeightEvents, allOhmsEvents)
-                        diagLines.add("v1.0 logs: ${arr.length()} záznamů")
-                    } else {
-                        diagLines.add(
-                            "v1.0 logs (${v1Resp.optInt("code", -1)}): ${v1Resp.optString("msg", "")}"
-                        )
-                    }
+                    diagLines.add("v1.0 logs: ${arr.length()} záznamů")
                 }
             }
 
@@ -316,7 +306,7 @@ object TuyaScaleClient {
             for ((wTime, wKg) in sortedWeights) {
                 if (merged.any { abs(it.timestampMillis - wTime) < 5_000L }) continue
                 val matchingOhms = allOhmsEvents
-                    .filter { abs(it.first - wTime) <= 25_000L }
+                    .filter { abs(it.first - wTime) <= 60_000L }
                     .minByOrNull { abs(it.first - wTime) }
                     ?.second
                 merged.add(
@@ -339,8 +329,11 @@ object TuyaScaleClient {
                 )
             }
 
+            val withOhmsCount = merged.count { it.impedanceOhms != null }
             val msg = if (merged.isEmpty()) {
-                "Spojení s Tuya IoT Core je funkční, ale váha zatím nemá uloženou nenulovou hmotnost (zvaž se naboso a načti znovu)."
+                "Spojení s Tuya IoT Core je funkční, ale váha zatím nemá uloženou nenulovou hmotnost."
+            } else if (withOhmsCount > 0) {
+                "Načteno ${merged.size} vážení (včetně odporu těla BR pro výpočet tuku a svalů)."
             } else {
                 "Načteno ${merged.size} vážení z Tuya IoT Core."
             }
@@ -421,54 +414,6 @@ object TuyaScaleClient {
         } catch (_: Throwable) {
         }
 
-        if (foundScale == null) {
-            for (specPath in listOf(
-                "/v1.0/iot-03/devices/$deviceId/specification",
-                "/v1.0/iot-03/devices/$deviceId/specifications",
-                "/v1.0/devices/$deviceId/specifications"
-            )) {
-                try {
-                    val resp = executeSignedGet(
-                        baseUrl = baseUrl,
-                        path = specPath,
-                        queryParams = TreeMap(),
-                        accessId = accessId,
-                        accessSecret = secret,
-                        accessToken = token,
-                        timeSkewMs = timeSkewMs
-                    )
-                    if (!resp.optBoolean("success", false)) continue
-                    val statusArr = resp.optJSONObject("result")?.optJSONArray("status") ?: continue
-                    for (i in 0 until statusArr.length()) {
-                        val item = statusArr.optJSONObject(i) ?: continue
-                        val code = item.optString("code", "").trim()
-                        if (isWeightCode(code)) {
-                            wCodes.add(code)
-                            val rawValues = item.opt("values")
-                            val valuesJson = when (rawValues) {
-                                is JSONObject -> rawValues
-                                is String -> if (rawValues.isNotBlank()) JSONObject(rawValues) else null
-                                else -> null
-                            }
-                            if (valuesJson != null) {
-                                if (foundScale == null && valuesJson.has("scale")) {
-                                    foundScale = valuesJson.optInt("scale")
-                                }
-                                val u = valuesJson.optString("unit", "").trim()
-                                if (foundUnit == null && u.isNotEmpty()) {
-                                    foundUnit = u
-                                }
-                            }
-                        } else if (isOhmsCode(code)) {
-                            rCodes.add(code)
-                        }
-                    }
-                    if (foundScale != null) break
-                } catch (_: Throwable) {
-                }
-            }
-        }
-
         return WeightSpecMeta(
             scale = foundScale,
             unit = foundUnit,
@@ -478,17 +423,20 @@ object TuyaScaleClient {
     }
 
     private fun isWeightCode(code: String): Boolean {
-        val c = code.lowercase()
+        val c = code.lowercase().trim()
         if (c.isEmpty()) return false
-        val excluded = listOf("unit", "trend", "state", "limit", "max", "min", "target", "alarm", "remind", "cal")
+        val excluded = listOf(
+            "count", "unit", "trend", "state", "limit", "max",
+            "min", "target", "alarm", "remind", "cal", "step"
+        )
         if (excluded.any { c.contains(it) }) return false
-        return c == "weight" || c == "weight_s" || c == "weight_kg" || c == "weight_g" || c == "body_weight" || c.startsWith("weight")
+        return c == "weight" || c == "weight_s" || c == "weight_kg" || c == "weight_g" || c == "body_weight"
     }
 
     private fun isOhmsCode(code: String): Boolean {
-        val c = code.lowercase()
+        val c = code.lowercase().trim()
         if (c.isEmpty()) return false
-        return c == "body_r" || c.contains("body_r") || c.contains("impedance") || c == "resistance"
+        return c == "br" || c == "body_r" || c == "impedance" || c == "resistance" || c == "body_resistance"
     }
 
     private fun normalizeTimestamp(rawTime: Long): Long {
@@ -551,32 +499,22 @@ object TuyaScaleClient {
         val unitLower = specUnit?.lowercase()?.trim().orEmpty()
         if (cleaned.contains('.') || cleaned.contains(',')) {
             val decimalVal = cleaned.replace(',', '.').toDoubleOrNull() ?: return null
-            val kg = if (unitLower == "g") decimalVal / 1000.0 else decimalVal
+            val kg = if (unitLower == "g" && decimalVal > 350.0) decimalVal / 1000.0 else decimalVal
             return kg.takeIf { it in 10.0..350.0 }
         }
 
         val rawNum = cleaned.toDoubleOrNull() ?: return null
         if (rawNum <= 0.0) return null
 
-        if (unitLower == "g") {
-            val grams = if (specScale != null && specScale > 0) {
-                rawNum / 10.0.pow(specScale.toDouble())
-            } else {
-                rawNum
-            }
-            val kgFromGrams = grams / 1000.0
-            if (kgFromGrams in 10.0..350.0) return kgFromGrams
-        }
-
-        if (specScale != null && specScale > 0) {
+        if (specScale != null && specScale > 0 && unitLower == "kg") {
             val scaledKg = rawNum / 10.0.pow(specScale.toDouble())
             if (scaledKg in 10.0..350.0) return scaledKg
         }
 
         val autoKg = when {
-            rawNum >= 30_000.0 -> rawNum / 1000.0
-            rawNum >= 2_500.0 -> rawNum / 100.0
-            rawNum > 350.0 -> rawNum / 10.0
+            rawNum > 35_000.0 -> rawNum / 1000.0
+            rawNum > 3_500.0 -> rawNum / 100.0
+            rawNum >= 150.0 -> rawNum / 10.0
             else -> rawNum
         }
         return autoKg.takeIf { it in 10.0..350.0 }
