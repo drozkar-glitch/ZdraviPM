@@ -75,7 +75,7 @@ class ContourSyncService : Service() {
                     spustHledaniGlukometru()
                 } else {
                     registerPassiveWatch(this)
-                    pripojKeGlukometru(adr, rucni Dotaz = true)
+                    pripojKeGlukometru(adr, rucniDotaz = true)
                 }
             }
 
@@ -571,7 +571,7 @@ class ContourSyncService : Service() {
         private fun spustSluzbuTise(context: Context, intent: Intent) {
             try {
                 context.applicationContext.startService(intent)
-            } catch (t: Throwable) {
+            } catch (_: Throwable) {
                 _bleStatus.value = "Automatický přenos vyžaduje v nastavení aplikace Baterie -> Bez omezení."
             }
         }
