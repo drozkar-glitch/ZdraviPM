@@ -13,7 +13,7 @@ class MainActivity : ComponentActivity() {
         val cfg = LocalHealthStore.loadConfig(this)
         val (_, address) = LocalHealthStore.getPairedMeter(this)
         if (cfg.backgroundServiceEnabled && !address.isNullOrBlank()) {
-            ContourSyncService.startIfPermitted(this)
+            ContourSyncService.registerPassiveWatch(this)
         }
 
         setContent {

@@ -2,8 +2,6 @@ package cz.mares.zdravipm
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
@@ -16,12 +14,12 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -44,19 +42,21 @@ class ContourSyncService : Service() {
     private val hlavniHandler = Handler(Looper.getMainLooper())
     private var aktivniGatt: BluetoothGatt? = null
     private var probihaSken = false
+    private var posledniSpusteniMs = 0L
 
     private val frontaDeskriptoru = ArrayDeque<Pair<BluetoothGattDescriptor, ByteArray>>()
     private val namereneVzorky = LinkedHashMap<Int, ParsedContourMeasurement>()
     private val jidloPodleSekvence = HashMap<Int, MealRelation>()
 
-    private val ulozeniZpozdeno = Runnable { ulozNamerenaData() }
+    private val ulozeniZpozdeno = Runnable { ulozNamerenaDataAUkonci(odpojitHned = false) }
     private val zastaveniSkenu = Runnable { zastavBleSken(ukoncitBezNalezu = true) }
+    private val ochrannyTimeout = Runnable { bezpecneUkonciSluzbu() }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        vytvorNotifikacniKanal()
+        odstranStaryNotifikacniKanal()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -66,34 +66,47 @@ class ContourSyncService : Service() {
             return START_NOT_STICKY
         }
 
-        spustPopredi("Hlídám glukometr Contour Plus One")
-
         when (intent?.action) {
             ACTION_SCAN_PAIR -> spustHledaniGlukometru()
+
             ACTION_SYNC_NOW -> {
                 val (_, adr) = LocalHealthStore.getPairedMeter(this)
                 if (adr.isNullOrBlank()) {
                     spustHledaniGlukometru()
                 } else {
-                    pripojKeGlukometru(adr, aktivniVyhledani = true)
+                    registerPassiveWatch(this)
+                    pripojKeGlukometru(adr, rucni Dotaz = true)
                 }
             }
+
+            ACTION_WAKE_SYNC -> {
+                val nyni = System.currentTimeMillis()
+                if (nyni - posledniSpusteniMs < 4_000L && aktivniGatt != null) {
+                    return START_NOT_STICKY
+                }
+                posledniSpusteniMs = nyni
+                val adr = intent.getStringExtra(EXTRA_DEVICE_ADDRESS)
+                    ?: LocalHealthStore.getPairedMeter(this).second
+                if (!adr.isNullOrBlank()) {
+                    pripojKeGlukometru(adr, rucniDotaz = false)
+                } else {
+                    stopSelf()
+                }
+            }
+
             ACTION_DISCONNECT -> {
+                unregisterPassiveWatch(this)
                 zastavBleSken(ukoncitBezNalezu = false)
                 uzavriGatt()
                 stopSelf()
-                return START_NOT_STICKY
             }
+
             else -> {
-                val (_, adr) = LocalHealthStore.getPairedMeter(this)
-                if (!adr.isNullOrBlank()) {
-                    pripojKeGlukometru(adr, aktivniVyhledani = false)
-                } else {
-                    _bleStatus.value = "Glukometr zatím není spárovaný"
-                }
+                registerPassiveWatch(this)
+                stopSelf()
             }
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
@@ -102,6 +115,15 @@ class ContourSyncService : Service() {
         uzavriGatt()
         sluzbaScope.cancel()
         super.onDestroy()
+    }
+
+    private fun odstranStaryNotifikacniKanal() {
+        try {
+            val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            mgr?.cancel(4201)
+            mgr?.deleteNotificationChannel("zdravipm_contour_sync")
+        } catch (_: Throwable) {
+        }
     }
 
     private fun nactiAdapter(): BluetoothAdapter? {
@@ -113,18 +135,19 @@ class ContourSyncService : Service() {
         val adapter = nactiAdapter()
         if (adapter == null || !adapter.isEnabled) {
             _bleStatus.value = "Zapni v telefonu Bluetooth."
+            stopSelf()
             return
         }
 
-        // Nejprve zkontrolujeme uz sparovana zarizeni v systemu Android
         val existujici = adapter.bondedDevices?.firstOrNull { dev ->
             dev.name?.contains("Contour", ignoreCase = true) == true
         }
         if (existujici != null) {
             val nazev = existujici.name ?: "Contour Plus One"
             LocalHealthStore.setPairedMeter(this, nazev, existujici.address)
-            _bleStatus.value = "Nalezen spárovaný $nazev,ipojuji..."
-            pripojKeGlukometru(existujici.address, aktivniVyhledani = false)
+            registerPassiveWatch(this)
+            _bleStatus.value = "Nalezen spárovaný $nazev – načítám záznamy..."
+            pripojKeGlukometru(existujici.address, rucniDotaz = true)
             return
         }
 
@@ -132,6 +155,7 @@ class ContourSyncService : Service() {
         val skener = adapter.bluetoothLeScanner
         if (skener == null) {
             _bleStatus.value = "BLE skener není dostupný."
+            stopSelf()
             return
         }
 
@@ -160,6 +184,7 @@ class ContourSyncService : Service() {
                 if (adr.isNullOrBlank()) {
                     _bleStatus.value = "Glukometr nenalezen. Zapni Contour (podrž tlačítko) a zkus to znovu."
                 }
+                stopSelf()
             }
         }
     }
@@ -176,15 +201,17 @@ class ContourSyncService : Service() {
             val ulozeneJmeno = jmeno.ifBlank { "Contour Plus One" }
             zastavBleSken(ukoncitBezNalezu = false)
             LocalHealthStore.setPairedMeter(this@ContourSyncService, ulozeneJmeno, dev.address)
+            registerPassiveWatch(this@ContourSyncService)
             _bleStatus.value = "Spárováno: $ulozeneJmeno. Čtu měření..."
-            pripojKeGlukometru(dev.address, aktivniVyhledani = true)
+            pripojKeGlukometru(dev.address, rucniDotaz = true)
         }
     }
 
-    private fun pripojKeGlukometru(adresa: String, aktivniVyhledani: Boolean) {
-        val adapter = nactiAdapter() ?: return
-        if (!adapter.isEnabled) {
-            _bleStatus.value = "Bluetooth je vypnutý – čekám na zapnutí."
+    private fun pripojKeGlukometru(adresa: String, rucniDotaz: Boolean) {
+        val adapter = nactiAdapter()
+        if (adapter == null || !adapter.isEnabled) {
+            _bleStatus.value = "Bluetooth je vypnutý."
+            stopSelf()
             return
         }
 
@@ -192,19 +219,23 @@ class ContourSyncService : Service() {
             adapter.getRemoteDevice(adresa)
         } catch (_: Throwable) {
             _bleStatus.value = "Neplatná Bluetooth adresa glukometru."
+            stopSelf()
             return
         }
 
         uzavriGatt()
-        _bleStatus.value = if (aktivniVyhledani) {
+        hlavniHandler.removeCallbacks(ochrannyTimeout)
+        hlavniHandler.postDelayed(ochrannyTimeout, if (rucniDotaz) 25_000L else 35_000L)
+
+        _bleStatus.value = if (rucniDotaz) {
             "Spojuji se s glukometrem ($adresa)..."
         } else {
-            "Čekám na zapnutí glukometru Contour na pozadí..."
+            "Glukometr detekován – stahuji měření..."
         }
 
         aktivniGatt = zarizeni.connectGatt(
             this,
-            !aktivniVyhledani,
+            false,
             gattObsluha,
             BluetoothDevice.TRANSPORT_LE
         )
@@ -224,26 +255,22 @@ class ContourSyncService : Service() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 _bleStatus.value = "Glukometr připojen – stahuji záznamy..."
-                aktualizujNotifikaci("Glukometr Contour připojen")
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                hlavniHandler.post { ulozNamerenaData() }
-                _bleStatus.value = "Glukometr v klidu – připraven na další měření"
-                aktualizujNotifikaci("Hlídám glukometr Contour Plus One")
-                val cfg = LocalHealthStore.loadConfig(this@ContourSyncService)
-                val (_, adr) = LocalHealthStore.getPairedMeter(this@ContourSyncService)
-                if (cfg.backgroundServiceEnabled && !adr.isNullOrBlank()) {
-                    hlavniHandler.postDelayed({
-                        pripojKeGlukometru(adr, aktivniVyhledani = false)
-                    }, 2_500L)
+                hlavniHandler.post {
+                    ulozNamerenaDataAUkonci(odpojitHned = true)
                 }
             }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) return
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                hlavniHandler.post { bezpecneUkonciSluzbu() }
+                return
+            }
             val sluzba = gatt.getService(ContourBleParser.GLUCOSE_SERVICE_UUID) ?: run {
                 _bleStatus.value = "Služba glukózy 0x1808 nebyla v zařízení nalezena."
+                hlavniHandler.post { bezpecneUkonciSluzbu() }
                 return
             }
 
@@ -348,7 +375,7 @@ class ContourSyncService : Service() {
                     synchronized(namereneVzorky) {
                         namereneVzorky[vzorek.sequenceNumber] = vzorek
                     }
-                    naplanujUlozeni(zpozdeniMs = 1_500L)
+                    naplanujUlozeni(zpozdeniMs = 1_800L)
                 }
             }
             uuidText.equals(ContourBleParser.GLUCOSE_CONTEXT_UUID.toString(), ignoreCase = true) -> {
@@ -356,11 +383,11 @@ class ContourSyncService : Service() {
                     synchronized(namereneVzorky) {
                         jidloPodleSekvence[sekvence] = jidlo
                     }
-                    naplanujUlozeni(zpozdeniMs = 1_000L)
+                    naplanujUlozeni(zpozdeniMs = 1_200L)
                 }
             }
             uuidText.equals(ContourBleParser.RACP_UUID.toString(), ignoreCase = true) -> {
-                naplanujUlozeni(zpozdeniMs = 300L)
+                naplanujUlozeni(zpozdeniMs = 450L)
             }
         }
     }
@@ -370,13 +397,20 @@ class ContourSyncService : Service() {
         hlavniHandler.postDelayed(ulozeniZpozdeno, zpozdeniMs)
     }
 
-    private fun ulozNamerenaData() {
+    private fun ulozNamerenaDataAUkonci(odpojitHned: Boolean) {
+        hlavniHandler.removeCallbacks(ulozeniZpozdeno)
         val davka: List<GlucoseEntry>
         val (jmenoGlukometru, _) = LocalHealthStore.getPairedMeter(this)
         val zdroj = jmenoGlukometru ?: "Contour Plus One"
 
         synchronized(namereneVzorky) {
-            if (namereneVzorky.isEmpty()) return
+            if (namereneVzorky.isEmpty()) {
+                if (odpojitHned) {
+                    _bleStatus.value = "Tiché hlídání při zapnutí glukometru (bez ikony v liště)"
+                    bezpecneUkonciSluzbu()
+                }
+                return
+            }
             davka = namereneVzorky.values.map { v ->
                 val jidlo = jidloPodleSekvence[v.sequenceNumber] ?: MealRelation.GENERAL
                 GlucoseEntry(
@@ -394,78 +428,35 @@ class ContourSyncService : Service() {
         }
 
         LocalHealthStore.upsertGlucoseEntries(this, davka)
-        _bleStatus.value = "Přijato ${davka.size} měření z glukometru – zapisuji do Health Connect..."
+        _bleStatus.value = "Přijato ${davka.size} měření – zapisuji do Health Connect..."
 
         sluzbaScope.launch {
             val vysledek = HealthConnectManager.syncRecords(applicationContext, forceAll = false)
             _bleStatus.value = if (vysledek.glucoseWritten > 0) {
-                "Přeneseno do Health Connect (${vysledek.glucoseWritten}× nový záznam)"
+                "Přeneseno do Health Connect (${vysledek.glucoseWritten}× záznam) • v klidu"
             } else {
-                "Měření uloženo v telefonu (${davka.size}×)"
+                "Uloženo v telefonu (${davka.size}×) • tiché hlídání aktivní"
             }
+            hlavniHandler.post { bezpecneUkonciSluzbu() }
         }
     }
 
-    private fun vytvorNotifikacniKanal() {
-        val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-        val kanal = NotificationChannel(
-            CHANNEL_ID,
-            "Synchronizace glukometru Contour",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "Tichý automatický přenos měření z glukometru do Health Connect"
-            setShowBadge(false)
-        }
-        mgr.createNotificationChannel(kanal)
-    }
-
-    private fun sestavNotifikaci(text: String): Notification {
-        val otevritIntent = Intent(this, MainActivity::class.java)
-        val pending = PendingIntent.getActivity(
-            this,
-            0,
-            otevritIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        return Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("Zdraví PM")
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentIntent(pending)
-            .setOngoing(true)
-            .build()
-    }
-
-    private fun spustPopredi(text: String) {
-        val notif = sestavNotifikaci(text)
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                startForeground(
-                    NOTIF_ID,
-                    notif,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-                )
-            } else {
-                startForeground(NOTIF_ID, notif)
-            }
-        } catch (_: Throwable) {
-        }
-    }
-
-    private fun aktualizujNotifikaci(text: String) {
-        val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-        mgr.notify(NOTIF_ID, sestavNotifikaci(text))
+    private fun bezpecneUkonciSluzbu() {
+        hlavniHandler.removeCallbacks(ochrannyTimeout)
+        uzavriGatt()
+        stopSelf()
     }
 
     companion object {
-        private const val CHANNEL_ID = "zdravipm_contour_sync"
-        private const val NOTIF_ID = 4201
-        private const val ACTION_START_BG = "cz.mares.zdravipm.START_BG"
+        const val ACTION_PASSIVE_BLE_FOUND = "cz.mares.zdravipm.PASSIVE_BLE_FOUND"
         private const val ACTION_SCAN_PAIR = "cz.mares.zdravipm.SCAN_PAIR"
         private const val ACTION_SYNC_NOW = "cz.mares.zdravipm.SYNC_NOW"
+        private const val ACTION_WAKE_SYNC = "cz.mares.zdravipm.WAKE_SYNC"
         private const val ACTION_DISCONNECT = "cz.mares.zdravipm.DISCONNECT"
+        private const val EXTRA_DEVICE_ADDRESS = "device_address"
+        private const val PASSIVE_PI_REQ_CODE = 4209
 
-        private val _bleStatus = MutableStateFlow("Připraveno pro Contour Plus One")
+        private val _bleStatus = MutableStateFlow("Tiché hlídání glukometru (bez ikony v liště)")
         val bleStatus: StateFlow<String> = _bleStatus.asStateFlow()
 
         private val _isScanning = MutableStateFlow(false)
@@ -483,9 +474,62 @@ class ContourSyncService : Service() {
             }
         }
 
-        fun startIfPermitted(context: Context) {
+        private fun vytvorPasivniPendingIntent(context: Context): PendingIntent {
+            val intent = Intent(context.applicationContext, BootReceiver::class.java).apply {
+                action = ACTION_PASSIVE_BLE_FOUND
+            }
+            val mutability = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+            } else {
+                PendingIntent.FLAG_UPDATE_CURRENT
+            }
+            return PendingIntent.getBroadcast(
+                context.applicationContext,
+                PASSIVE_PI_REQ_CODE,
+                intent,
+                mutability
+            )
+        }
+
+        fun registerPassiveWatch(context: Context) {
             if (!maBleOpravneni(context)) return
-            odesliAkci(context, ACTION_START_BG)
+            val cfg = LocalHealthStore.loadConfig(context)
+            val (_, adr) = LocalHealthStore.getPairedMeter(context)
+            if (!cfg.backgroundServiceEnabled || adr.isNullOrBlank()) {
+                unregisterPassiveWatch(context)
+                return
+            }
+
+            try {
+                val mgr = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+                val scanner = mgr?.adapter?.takeIf { it.isEnabled }?.bluetoothLeScanner ?: return
+                val filter = ScanFilter.Builder()
+                    .setDeviceAddress(adr)
+                    .build()
+                val settingsBuilder = ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_OPPORTUNISTIC)
+                    .setCallbackType(ScanSettings.CALLBACK_TYPE_FIRST_MATCH)
+                scanner.startScan(
+                    listOf(filter),
+                    settingsBuilder.build(),
+                    vytvorPasivniPendingIntent(context)
+                )
+                _bleStatus.value = "Tiché hlídání při zapnutí glukometru (bez ikony v liště)"
+            } catch (_: Throwable) {
+            }
+        }
+
+        fun unregisterPassiveWatch(context: Context) {
+            try {
+                val mgr = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+                val scanner = mgr?.adapter?.bluetoothLeScanner ?: return
+                scanner.stopScan(vytvorPasivniPendingIntent(context))
+            } catch (_: Throwable) {
+            }
+        }
+
+        fun startIfPermitted(context: Context) {
+            registerPassiveWatch(context)
         }
 
         fun scanAndPair(context: Context) {
@@ -493,7 +537,9 @@ class ContourSyncService : Service() {
                 _bleStatus.value = "Nejprve povol oprávnění Bluetooth (Blízká zařízení)."
                 return
             }
-            odesliAkci(context, ACTION_SCAN_PAIR)
+            spustSluzbuTise(context, Intent(context.applicationContext, ContourSyncService::class.java).apply {
+                action = ACTION_SCAN_PAIR
+            })
         }
 
         fun syncNow(context: Context) {
@@ -501,24 +547,32 @@ class ContourSyncService : Service() {
                 _bleStatus.value = "Nejprve povol oprávnění Bluetooth."
                 return
             }
-            odesliAkci(context, ACTION_SYNC_NOW)
+            spustSluzbuTise(context, Intent(context.applicationContext, ContourSyncService::class.java).apply {
+                action = ACTION_SYNC_NOW
+            })
+        }
+
+        fun syncQuietlyFromWakeup(context: Context, address: String) {
+            if (!maBleOpravneni(context)) return
+            spustSluzbuTise(context, Intent(context.applicationContext, ContourSyncService::class.java).apply {
+                action = ACTION_WAKE_SYNC
+                putExtra(EXTRA_DEVICE_ADDRESS, address)
+            })
         }
 
         fun stopService(context: Context) {
+            unregisterPassiveWatch(context)
             try {
                 context.stopService(Intent(context, ContourSyncService::class.java))
             } catch (_: Throwable) {
             }
         }
 
-        private fun odesliAkci(context: Context, akce: String) {
+        private fun spustSluzbuTise(context: Context, intent: Intent) {
             try {
-                val intent = Intent(context.applicationContext, ContourSyncService::class.java).apply {
-                    action = akce
-                }
-                ContextCompat.startForegroundService(context.applicationContext, intent)
+                context.applicationContext.startService(intent)
             } catch (t: Throwable) {
-                _bleStatus.value = "Službu na pozadí nelze spustit: ${t.message ?: ""}"
+                _bleStatus.value = "Automatický přenos vyžaduje v nastavení aplikace Baterie -> Bez omezení."
             }
         }
     }
