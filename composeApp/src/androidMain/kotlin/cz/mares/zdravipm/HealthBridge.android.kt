@@ -190,8 +190,9 @@ private class AndroidHealthBridge(
                 return@launch
             }
 
+            val refWeight = cfg.referenceWeightKg
             // Rezim kalibrace (kdyz jeste neni vybrana vychozi vaha nebo uzivatel klepl na prekalibrovani)
-            if (forceCalibrationList || cfg.referenceWeightKg == null) {
+            if (forceCalibrationList || refWeight == null) {
                 _state.update {
                     it.copy(
                         isScaleSyncing = false,
@@ -208,7 +209,7 @@ private class AndroidHealthBridge(
             val serazeneOdNejstarsiho = vysledek.candidates.sortedBy { it.timestampMillis }
             val existujici = LocalHealthStore.loadScaleList(appContext)
             var nejnovejsiUlozenyCas = existujici.maxOfOrNull { it.timestampMillis } ?: 0L
-            var aktualniReference = cfg.referenceWeightKg
+            var aktualniReference: Double = refWeight
             val prijatePolozky = ArrayList<ScaleEntry>()
             var preskocenoCizich = 0
 
