@@ -3,6 +3,8 @@ package cz.mares.zdravipm
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.le.BluetoothLeScanner
+import android.bluetooth.le.ScanResult
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -24,7 +26,7 @@ class BootReceiver : BroadcastReceiver() {
             Intent.ACTION_BOOT_COMPLETED,
             Intent.ACTION_MY_PACKAGE_REPLACED -> {
                 if (cfg.backgroundServiceEnabled && !pairedAddr.isNullOrBlank()) {
-                    ContourSyncService.registerPassiveWatch(appCtx)
+                    ContourSyncService.ensureBackgroundWatch(appCtx)
                 }
                 TuyaScaleSyncJobService.syncSchedule(appCtx)
             }
@@ -32,7 +34,9 @@ class BootReceiver : BroadcastReceiver() {
             BluetoothAdapter.ACTION_STATE_CHANGED -> {
                 val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
                 if (state == BluetoothAdapter.STATE_ON && cfg.backgroundServiceEnabled && !pairedAddr.isNullOrBlank()) {
-                    ContourSyncService.registerPassiveWatch(appCtx)
+                    ContourSyncService.ensureBackgroundWatch(appCtx)
+                } else if (state == BluetoothAdapter.STATE_OFF) {
+                    ContourSyncService.unregisterPassiveWatch(appCtx)
                 }
             }
 
@@ -62,16 +66,39 @@ class BootReceiver : BroadcastReceiver() {
                         devName.ifBlank { "Contour Plus One" },
                         devAddr
                     )
-                    ContourSyncService.registerPassiveWatch(appCtx)
                 }
                 TuyaScaleSyncJobService.triggerOpportunisticCheckIfDue(appCtx)
                 spustAsynchronniProbuzeni(appCtx, devAddr)
             }
 
             ContourSyncService.ACTION_PASSIVE_BLE_FOUND -> {
-                if (!cfg.backgroundServiceEnabled || pairedAddr.isNullOrBlank()) return
+                if (!cfg.backgroundServiceEnabled) return
+                val scanResults = extractScanResults(intent)
+                var targetAddr: String? = pairedAddr
+
+                if (!scanResults.isNullOrEmpty()) {
+                    for (sr in scanResults) {
+                        val d = sr.device ?: continue
+                        val addr = d.address ?: continue
+                        val name = try {
+                            d.name ?: sr.scanRecord?.deviceName ?: ""
+                        } catch (_: Throwable) {
+                            ""
+                        }
+                        if (!pairedAddr.isNullOrBlank() && pairedAddr.equals(addr, ignoreCase = true)) {
+                            targetAddr = addr
+                            break
+                        }
+                        if (pairedAddr.isNullOrBlank() && name.contains("Contour", ignoreCase = true)) {
+                            targetAddr = addr
+                            break
+                        }
+                    }
+                }
+
+                if (targetAddr.isNullOrBlank()) return
                 TuyaScaleSyncJobService.triggerOpportunisticCheckIfDue(appCtx)
-                spustAsynchronniProbuzeni(appCtx, pairedAddr)
+                spustAsynchronniProbuzeni(appCtx, targetAddr)
             }
         }
     }
@@ -91,8 +118,9 @@ class BootReceiver : BroadcastReceiver() {
             }
         }
 
-        val ochrannyLimit = Runnable { bezpecneDokonci() }
-        handler.postDelayed(ochrannyLimit, 8_500L)
+        // Samotne mereni prouzku drzi nazivu TuyaScaleSyncJobService (JOB_ID_BLE_HOLD),
+        // takze BroadcastReceiver muzeme bezpecne uvolnit pred 10s ANR limitem systemu.
+        handler.postDelayed({ bezpecneDokonci() }, 4_500L)
         ContourSyncService.syncQuietlyFromWakeup(appCtx, address) {
             bezpecneDokonci()
         }
@@ -104,6 +132,22 @@ class BootReceiver : BroadcastReceiver() {
         } else {
             @Suppress("DEPRECATION")
             intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+        }
+    }
+
+    private fun extractScanResults(intent: Intent): ArrayList<ScanResult>? {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableArrayListExtra(
+                    BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT,
+                    ScanResult::class.java
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableArrayListExtra(BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT)
+            }
+        } catch (_: Throwable) {
+            null
         }
     }
 }

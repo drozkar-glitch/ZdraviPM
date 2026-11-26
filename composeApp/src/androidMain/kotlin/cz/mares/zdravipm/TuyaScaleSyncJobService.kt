@@ -10,43 +10,97 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 
 class TuyaScaleSyncJobService : JobService() {
 
-    private var activeJob: Job? = null
+    private var periodicScaleJob: Job? = null
+    private var bleHoldJob: Job? = null
 
     override fun onStartJob(params: JobParameters?): Boolean {
+        val jobId = params?.jobId ?: return false
         val appCtx = applicationContext
-        activeJob = bgScope.launch {
-            try {
-                performSilentScaleSync(appCtx)
-            } finally {
-                if (params != null) {
+
+        if (jobId == JOB_ID_BLE_HOLD) {
+            bleHoldJob?.cancel()
+            bleHoldJob = bgScope.launch {
+                try {
+                    val startMs = System.currentTimeMillis()
+                    while (ContourSyncService.isBleSessionActive() &&
+                        System.currentTimeMillis() - startMs < MAX_BLE_HOLD_MS
+                    ) {
+                        delay(500L)
+                    }
+                } finally {
                     jobFinished(params, false)
                 }
+            }
+            return true
+        }
+
+        periodicScaleJob = bgScope.launch {
+            try {
+                ContourSyncService.ensureBackgroundWatch(appCtx)
+                performSilentScaleSync(appCtx)
+            } finally {
+                jobFinished(params, false)
             }
         }
         return true
     }
 
     override fun onStopJob(params: JobParameters?): Boolean {
-        activeJob?.cancel()
-        activeJob = null
+        val jobId = params?.jobId
+        if (jobId == JOB_ID_BLE_HOLD) {
+            bleHoldJob?.cancel()
+            bleHoldJob = null
+            return false
+        }
+        periodicScaleJob?.cancel()
+        periodicScaleJob = null
         return true
     }
 
     companion object {
-        private const val JOB_ID = 4210
+        private const val JOB_ID_SCALE_PERIODIC = 4210
+        private const val JOB_ID_BLE_HOLD = 4211
         private const val THREE_HOURS_MS = 3L * 60L * 60L * 1000L
         private const val OPPORTUNISTIC_COOLDOWN_MS = 15L * 60L * 1000L
+        private const val MAX_BLE_HOLD_MS = 105_000L
         private const val PREF_SYNC_META = "zdravipm_scale_bg_meta"
         private const val KEY_LAST_CHECK_MS = "last_auto_scale_check_ms"
 
         private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         private val isSyncRunning = AtomicBoolean(false)
+
+        fun holdProcessForBleSession(context: Context, maxDurationMs: Long = MAX_BLE_HOLD_MS) {
+            val appCtx = context.applicationContext
+            val scheduler = appCtx.getSystemService(Context.JOB_SCHEDULER_SERVICE) as? JobScheduler
+                ?: return
+            try {
+                if (scheduler.getPendingJob(JOB_ID_BLE_HOLD) != null) return
+                val component = ComponentName(appCtx, TuyaScaleSyncJobService::class.java)
+                val jobInfo = JobInfo.Builder(JOB_ID_BLE_HOLD, component)
+                    .setOverrideDeadline(0L)
+                    .setMinimumLatency(0L)
+                    .build()
+                scheduler.schedule(jobInfo)
+            } catch (_: Throwable) {
+            }
+        }
+
+        fun releaseBleSessionHold(context: Context) {
+            val appCtx = context.applicationContext
+            val scheduler = appCtx.getSystemService(Context.JOB_SCHEDULER_SERVICE) as? JobScheduler
+                ?: return
+            try {
+                scheduler.cancel(JOB_ID_BLE_HOLD)
+            } catch (_: Throwable) {
+            }
+        }
 
         fun syncSchedule(context: Context) {
             val appCtx = context.applicationContext
@@ -59,7 +113,7 @@ class TuyaScaleSyncJobService : JobService() {
 
             if (!shouldRun) {
                 try {
-                    scheduler.cancel(JOB_ID)
+                    scheduler.cancel(JOB_ID_SCALE_PERIODIC)
                 } catch (_: Throwable) {
                 }
                 return
@@ -68,12 +122,12 @@ class TuyaScaleSyncJobService : JobService() {
             if (isSyncRunning.get()) return
 
             try {
-                val existing = scheduler.getPendingJob(JOB_ID)
+                val existing = scheduler.getPendingJob(JOB_ID_SCALE_PERIODIC)
                 if (existing != null && existing.isPeriodic && existing.intervalMillis == THREE_HOURS_MS) {
                     return
                 }
                 val component = ComponentName(appCtx, TuyaScaleSyncJobService::class.java)
-                val jobInfo = JobInfo.Builder(JOB_ID, component)
+                val jobInfo = JobInfo.Builder(JOB_ID_SCALE_PERIODIC, component)
                     .setPeriodic(THREE_HOURS_MS)
                     .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
                     .setPersisted(true)
