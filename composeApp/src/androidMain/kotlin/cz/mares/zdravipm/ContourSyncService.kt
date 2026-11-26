@@ -46,7 +46,7 @@ class ContourSyncService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val appCtx = applicationContext
         when (intent?.action) {
-            ACTION_SCAN_AND_PAIR -> spustAktivni ParovaniInterni(appCtx)
+            ACTION_SCAN_AND_PAIR -> spustAktivniParovaniInterni(appCtx)
             ACTION_SYNC_NOW -> spustOkamzitySyncInterni(appCtx)
             ACTION_STOP_ALL -> zastavVseInterni(appCtx)
             else -> ensureBackgroundWatch(appCtx)
@@ -235,7 +235,6 @@ class ContourSyncService : Service() {
             TuyaScaleSyncJobService.holdProcessForBleSession(appCtx, MAX_STRIP_SESSION_MS + 10_000L)
             planujStropRelace(appCtx)
 
-            // BroadcastReceiver muze skoncit brzy, protoze JobService uz drzi proces nazivu
             mainHandler.postDelayed({ dokonciWakeupCallbacky() }, 2_500L)
 
             synchronized(gattLock) {
@@ -247,8 +246,6 @@ class ContourSyncService : Service() {
                 }
             }
 
-            // Pokud uz bezi standby autoConnect, dej mu 1,2 s na dokonceni linkoveho spojeni,
-            // jinak prepni na primy prioritni connectGatt(autoConnect = false)
             wakeupFallbackJob?.cancel()
             wakeupFallbackJob = serviceScope.launch {
                 val melStandby = synchronized(gattLock) { isStandbyAutoWaiting && activeGatt != null }
@@ -629,7 +626,6 @@ class ContourSyncService : Service() {
             ) {
                 val charUuid = descriptor.characteristic?.uuid ?: return
                 if (status != BluetoothGatt.GATT_SUCCESS) {
-                    // Pokud jeste dobiha sifrovani linky (bonding), zopakuj zapis po 650 ms
                     mainHandler.postDelayed({
                         when (charUuid) {
                             ContourBleParser.GLUCOSE_MEASUREMENT_UUID -> zapniNotifikaceKrok1Mereni(gatt, 1)
@@ -693,10 +689,8 @@ class ContourSyncService : Service() {
 
                 ContourBleParser.RACP_UUID -> {
                     racpBusy = false
-                    // RACP Response Code (0x06): [0x06, 0x00, reqOpCode, rspCodeValue]
                     if (bytes.size >= 4 && (bytes[0].toInt() and 0xFF) == 0x06) {
                         val rspCode = bytes[3].toInt() and 0xFF
-                        // 0x01 = Success, 0x06 = No records found; jiny kod (napr. 0x04 Operator not supported)
                         if (rspCode != 0x01 && rspCode != 0x06 && lastRecordOperatorSupported) {
                             lastRecordOperatorSupported = false
                             vyzadejVsechnyZaznamyPresRacp()
@@ -850,13 +844,11 @@ class ContourSyncService : Service() {
             if (!initialAllRecordsRequested || !lastRecordOperatorSupported) {
                 vyzadejVsechnyZaznamyPresRacp()
             } else {
-                // 0x01 = Report Stored Records, 0x06 = Last record (okamzita kontrola cerstve kapky krve)
                 odesliRacpPrikaz(byteArrayOf(0x01, 0x06))
             }
         }
 
         private fun vyzadejVsechnyZaznamyPresRacp() {
-            // 0x01 = Report Stored Records, 0x01 = All records
             odesliRacpPrikaz(byteArrayOf(0x01, 0x01))
         }
 
